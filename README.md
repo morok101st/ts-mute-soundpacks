@@ -52,7 +52,7 @@ build.bat
 
 Ergebnis: `build\MuteSoundpack_<version>.ts3_plugin`.
 
-Die DLL wird ohne C-Laufzeitbibliothek gebaut (`/NODEFAULTLIB`) und importiert nur `kernel32.dll`. Die TeamSpeak-Header kommen aus dem offiziellen [ts3client-pluginsdk](https://github.com/TeamSpeak-Systems/ts3client-pluginsdk) im Submodul `sdk/`.
+Die DLL wird ohne C-Laufzeitbibliothek gebaut (`/NODEFAULTLIB`) und importiert nur die Windows-Systembibliotheken `kernel32.dll` und `user32.dll`. Die TeamSpeak-Header kommen aus dem offiziellen [ts3client-pluginsdk](https://github.com/TeamSpeak-Systems/ts3client-pluginsdk) im Submodul `sdk/`.
 
 ## Neue Version veröffentlichen
 
