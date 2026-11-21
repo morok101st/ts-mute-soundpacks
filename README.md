@@ -56,7 +56,7 @@ Die DLL wird ohne C-Laufzeitbibliothek gebaut (`/NODEFAULTLIB`) und importiert n
 
 ## Neue Version veröffentlichen
 
-1. Versionsnummer anpassen in `src/mute_soundpack.c` (`PLUGIN_VERSION`), `package/package.ini` (`Version`) und `build.bat` (`VERSION`).
+1. Versionsnummer in `src/mute_soundpack.c` anpassen (`PLUGIN_VERSION`). `build.bat` übernimmt sie automatisch in Dateinamen und `package.ini`.
 2. Committen, dann taggen und pushen:
    ```bat
    git tag v1.2
@@ -68,7 +68,7 @@ Die DLL wird ohne C-Laufzeitbibliothek gebaut (`/NODEFAULTLIB`) und importiert n
 
 ```
 src/mute_soundpack.c        Plugin-Quellcode
-package/package.ini      Metadaten für den TS3-Installer
+package/package.ini      Vorlage für die Installer-Metadaten (@VERSION@ wird beim Build ersetzt)
 sdk/                     TeamSpeak Plugin SDK (Git-Submodul)
 build.bat                Build + Paketierung
 .github/workflows/       CI-Build und Releases
