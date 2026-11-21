@@ -39,6 +39,17 @@ __declspec(dllimport) BOOL ReadFile(HANDLE, void*, DWORD, DWORD*, void*);
 __declspec(dllimport) BOOL WriteFile(HANDLE, const void*, DWORD, DWORD*, void*);
 __declspec(dllimport) BOOL CloseHandle(HANDLE);
 __declspec(dllimport) BOOL DeleteFileW(const unsigned short*);
+typedef void (__stdcall *WAITORTIMERCALLBACK)(void*, unsigned char);
+#define WT_EXECUTEONLYONCE 0x8
+__declspec(dllimport) HANDLE __stdcall CreateTimerQueue(void);
+__declspec(dllimport) BOOL __stdcall CreateTimerQueueTimer(HANDLE*, HANDLE, WAITORTIMERCALLBACK, void*, DWORD, DWORD, unsigned long);
+__declspec(dllimport) BOOL __stdcall DeleteTimerQueueTimer(HANDLE, HANDLE, HANDLE);
+__declspec(dllimport) BOOL __stdcall DeleteTimerQueueEx(HANDLE, HANDLE);
+typedef struct { void* a; long b; long c; void* d; void* e; unsigned long long f; } CRITSEC;
+__declspec(dllimport) void __stdcall InitializeCriticalSection(CRITSEC*);
+__declspec(dllimport) void __stdcall EnterCriticalSection(CRITSEC*);
+__declspec(dllimport) void __stdcall LeaveCriticalSection(CRITSEC*);
+__declspec(dllimport) void __stdcall DeleteCriticalSection(CRITSEC*);
 __declspec(dllimport) int MultiByteToWideChar(unsigned int, DWORD, const char*, int, unsigned short*, int);
 __declspec(dllimport) int WideCharToMultiByte(unsigned int, DWORD, const unsigned short*, int, char*, int, const char*, BOOL*);
 
@@ -137,7 +148,24 @@ static struct {
 } cfg;
 
 #define MAX_HANDLERS 32
-static struct { uint64 sch; int active; float saved; } slots[MAX_HANDLERS];
+static struct {
+    uint64 sch;
+    int active;
+    float saved;
+    HANDLE timer;      /* geplantes, verzoegertes Absenken */
+    unsigned int gen;  /* entwertet veraltete Timer */
+} slots[MAX_HANDLERS];
+
+/* Verzoegerung beim Betreten eines Mute-Channels, damit der
+   "Channel switched"-Sound noch vollstaendig abgespielt wird. */
+#define ACTIVATE_DELAY_MS 1000
+
+/* Events, Einstellungsdialog und Timer laufen in verschiedenen Threads. */
+static CRITSEC lock;
+static HANDLE timer_queue;
+static int shutting_down;
+#define LOCK() EnterCriticalSection(&lock)
+#define UNLOCK() LeaveCriticalSection(&lock)
 
 static int slot_for(uint64 sch, int create) {
     int i;
@@ -376,15 +404,59 @@ static int my_id(uint64 sch, anyID* me) {
     return ts3.getClientID(sch, me) == ERROR_ok;
 }
 
-static void evaluate(uint64 sch) {
+static int in_muted_channel(uint64 sch) {
     anyID me; uint64 ch = 0;
-    if (!my_id(sch, &me)) return;
-    if (ts3.getChannelOfClient(sch, me, &ch) != ERROR_ok) return;
+    if (!my_id(sch, &me)) return -1;
+    if (ts3.getChannelOfClient(sch, me, &ch) != ERROR_ok) return -1;
+    return channel_matches(sch, ch);
+}
+
+static void cancel_pending(int i) {
+    if (slots[i].timer) {
+        DeleteTimerQueueTimer(timer_queue, slots[i].timer, 0); /* nicht blockierend */
+        slots[i].timer = 0;
+    }
+    slots[i].gen++;
+}
+
+static void __stdcall delayed_activate(void* param, unsigned char fired) {
+    unsigned long long v = (unsigned long long)param;
+    int i = (int)(v & 0xFF);
+    unsigned int gen = (unsigned int)(v >> 8);
+    (void)fired;
+    LOCK();
+    if (!shutting_down && slots[i].gen == gen && slots[i].timer) {
+        DeleteTimerQueueTimer(timer_queue, slots[i].timer, 0);
+        slots[i].timer = 0;
+        if (in_muted_channel(slots[i].sch) == 1) activate(slots[i].sch);
+    }
+    UNLOCK();
+}
+
+static void schedule_activate(uint64 sch) {
+    int i = slot_for(sch, 1);
+    if (i < 0) return;
+    if (slots[i].active) { activate(sch); return; } /* nur Lautstaerke aktualisieren */
+    if (slots[i].timer) return;                     /* schon geplant */
+    slots[i].gen++;
+    if (!timer_queue || !CreateTimerQueueTimer(&slots[i].timer, timer_queue, delayed_activate,
+            (void*)(((unsigned long long)slots[i].gen << 8) | (unsigned long long)i),
+            ACTIVATE_DELAY_MS, 0, WT_EXECUTEONLYONCE)) {
+        slots[i].timer = 0;
+        activate(sch); /* Fallback: sofort */
+    }
+}
+
+static void evaluate(uint64 sch) {
+    int m;
     load_config();
-    if (channel_matches(sch, ch)) {
-        activate(sch);
+    m = in_muted_channel(sch);
+    if (m < 0) return;
+    if (m) {
+        schedule_activate(sch);
     } else {
         int i = slot_for(sch, 0);
+        if (i >= 0) cancel_pending(i);
         if (i >= 0 && slots[i].active) deactivate(sch, 1);
         else recover(sch);
     }
@@ -392,7 +464,9 @@ static void evaluate(uint64 sch) {
 
 static void on_own_move(uint64 sch, anyID clientID) {
     anyID me;
+    LOCK();
     if (my_id(sch, &me) && me == clientID) evaluate(sch);
+    UNLOCK();
 }
 
 static void evaluate_all(void) {
@@ -608,10 +682,15 @@ static int dlg_apply(HWND dlg) {
 
 static INT_PTR __stdcall dlg_proc(HWND dlg, unsigned int msg, WPARAM wp, LPARAM lp) {
     (void)lp;
-    if (msg == WM_INITDIALOG) { dlg_init(dlg); return 1; }
+    if (msg == WM_INITDIALOG) { LOCK(); dlg_init(dlg); UNLOCK(); return 1; }
     if (msg == WM_COMMAND) {
         int id = (int)(wp & 0xFFFF);
-        if (id == IDOK) { if (dlg_apply(dlg)) EndDialog(dlg, 1); return 1; }
+        if (id == IDOK) {
+            int ok;
+            LOCK(); ok = dlg_apply(dlg); UNLOCK();
+            if (ok) EndDialog(dlg, 1);
+            return 1;
+        }
         if (id == IDCANCEL) { EndDialog(dlg, 0); return 1; }
     }
     return 0;
@@ -630,15 +709,30 @@ EXPORT void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3
 
 EXPORT int ts3plugin_init(void) {
     memset(slots, 0, sizeof(slots));
+    shutting_down = 0;
+    InitializeCriticalSection(&lock);
+    timer_queue = CreateTimerQueue();
+    LOCK();
     load_config();
     /* Plugin waehrend laufender Verbindung aktiviert: sofort pruefen */
     evaluate_all();
+    UNLOCK();
     return 0;
 }
 
 EXPORT void ts3plugin_shutdown(void) {
     int i;
-    for (i = 0; i < MAX_HANDLERS; i++) if (slots[i].sch && slots[i].active) deactivate(slots[i].sch, 0);
+    LOCK(); shutting_down = 1; UNLOCK();
+    /* Alle Timer abbrechen und auf laufende Callbacks warten (ohne Sperre,
+       sonst Deadlock), damit nach dem Entladen nichts mehr feuert. */
+    if (timer_queue) { DeleteTimerQueueEx(timer_queue, INVALID_HANDLE_VALUE); timer_queue = 0; }
+    LOCK();
+    for (i = 0; i < MAX_HANDLERS; i++) {
+        slots[i].timer = 0;
+        if (slots[i].sch && slots[i].active) deactivate(slots[i].sch, 0);
+    }
+    UNLOCK();
+    DeleteCriticalSection(&lock);
 }
 
 EXPORT void ts3plugin_registerPluginID(const char* id) { (void)id; }
@@ -650,22 +744,25 @@ EXPORT void ts3plugin_configure(void* handle, void* qParentWidget) {
     (void)handle; (void)qParentWidget;
     if (open) return;
     open = 1;
-    if (DialogBoxIndirectParamW(0, build_template(), GetActiveWindow(), dlg_proc, 0) == 1)
-        evaluate_all(); /* neue Einstellungen sofort anwenden */
+    if (DialogBoxIndirectParamW(0, build_template(), GetActiveWindow(), dlg_proc, 0) == 1) {
+        LOCK(); evaluate_all(); UNLOCK(); /* neue Einstellungen sofort anwenden */
+    }
     open = 0;
 }
 
 /* ---------------- Events ---------------- */
 EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 sch, int newStatus, unsigned int errorNumber) {
     (void)errorNumber;
+    LOCK();
     if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
         evaluate(sch);
     } else if (newStatus == STATUS_DISCONNECTED) {
-        int i;
+        int i = slot_for(sch, 0);
+        if (i >= 0) cancel_pending(i);
         deactivate(sch, 0);
-        i = slot_for(sch, 0);
         if (i >= 0) slots[i].sch = 0;
     }
+    UNLOCK();
 }
 
 EXPORT void ts3plugin_onClientMoveEvent(uint64 sch, anyID clientID, uint64 oldChannelID, uint64 newChannelID, int visibility, const char* moveMessage) {
@@ -686,5 +783,7 @@ EXPORT void ts3plugin_onClientKickFromChannelEvent(uint64 sch, anyID clientID, u
 EXPORT void ts3plugin_onUpdateChannelEditedEvent(uint64 sch, uint64 channelID, anyID invokerID, const char* invokerName, const char* invokerUniqueIdentifier) {
     anyID me; uint64 ch = 0;
     (void)invokerID; (void)invokerName; (void)invokerUniqueIdentifier;
+    LOCK();
     if (my_id(sch, &me) && ts3.getChannelOfClient(sch, me, &ch) == ERROR_ok && ch == channelID) evaluate(sch);
+    UNLOCK();
 }
