@@ -3,7 +3,7 @@ setlocal
 rem Baut mute_soundpack_win64.dll und paketiert sie als .ts3_plugin.
 rem Benoetigt MSVC (Visual Studio / Build Tools, x64). Aufruf aus normaler Konsole moeglich.
 
-set VERSION=1.2
+set VERSION=1.3
 set NAME=MuteSoundpack
 set DLL=mute_soundpack_win64.dll
 
