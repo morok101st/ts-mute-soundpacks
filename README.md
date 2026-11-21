@@ -9,8 +9,11 @@ Technisch setzt das Plugin den Playback-Wert `volume_factor_wave` pro Server-Ver
 ## Installation
 
 1. Die aktuelle `.ts3_plugin`-Datei unter [Releases](../../releases) herunterladen.
-2. Doppelklick auf die Datei, der TeamSpeak-Installer übernimmt den Rest.
-3. In TeamSpeak unter *Extras → Optionen → Addons* das Plugin aktivieren.
+2. TeamSpeak vollständig schließen (auch im Infobereich der Taskleiste).
+3. Doppelklick auf die Datei, der TeamSpeak-Installer übernimmt den Rest.
+4. TeamSpeak starten und unter *Extras → Optionen → Addons* das Plugin aktivieren.
+
+Das gilt auch für Updates: TeamSpeak muss beim Installieren geschlossen sein, sonst kann die alte Plugin-Datei nicht ersetzt werden.
 
 Nur Windows 64-bit.
 
