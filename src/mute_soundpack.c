@@ -1,0 +1,370 @@
+/*
+ * Mute Soundpack - TeamSpeak 3 Plugin
+ *
+ * Senkt die Lautstaerke der TeamSpeak-Soundpack-Sounds ("volume_factor_wave"),
+ * solange man sich in einem konfigurierten Channel befindet, und stellt den
+ * vorherigen Wert beim Verlassen wieder her. Sprach-Audio wird nicht angefasst.
+ *
+ * Gebaut ohne C-Laufzeitbibliothek (freestanding), importiert nur kernel32.
+ */
+
+#include "ts3_functions.h"
+#include "plugin_definitions.h"
+#include "teamspeak/public_errors.h"
+#include "teamspeak/public_definitions.h"
+
+#define EXPORT __declspec(dllexport)
+#define PLUGIN_API_VERSION 26
+#define PLUGIN_NAME "Mute Soundpack"
+#define PLUGIN_VERSION "1.1"
+#define INI_NAME "mute_soundpack.ini"
+
+/* ---------------- minimale Win32-Deklarationen ---------------- */
+typedef void* HANDLE;
+typedef unsigned long DWORD;
+typedef int BOOL;
+#define INVALID_HANDLE_VALUE ((HANDLE)(long long)-1)
+#define GENERIC_READ 0x80000000UL
+#define GENERIC_WRITE 0x40000000UL
+#define FILE_SHARE_READ 0x1
+#define CREATE_NEW 1
+#define OPEN_EXISTING 3
+#define FILE_ATTRIBUTE_NORMAL 0x80
+#define CP_UTF8 65001
+
+__declspec(dllimport) HANDLE CreateFileW(const unsigned short*, DWORD, DWORD, void*, DWORD, DWORD, HANDLE);
+__declspec(dllimport) BOOL ReadFile(HANDLE, void*, DWORD, DWORD*, void*);
+__declspec(dllimport) BOOL WriteFile(HANDLE, const void*, DWORD, DWORD*, void*);
+__declspec(dllimport) BOOL CloseHandle(HANDLE);
+__declspec(dllimport) int MultiByteToWideChar(unsigned int, DWORD, const char*, int, unsigned short*, int);
+
+/* ---------------- CRT-Ersatz ---------------- */
+int _fltused = 0;
+
+void* memset(void* d, int c, size_t n) {
+    volatile unsigned char* p = (volatile unsigned char*)d;
+    while (n--) *p++ = (unsigned char)c;
+    return d;
+}
+void* memcpy(void* d, const void* s, size_t n) {
+    volatile unsigned char* a = (volatile unsigned char*)d;
+    const volatile unsigned char* b = (const volatile unsigned char*)s;
+    while (n--) *a++ = *b++;
+    return d;
+}
+
+BOOL __stdcall DllEntry(void* h, DWORD reason, void* reserved) {
+    (void)h; (void)reason; (void)reserved;
+    return 1;
+}
+
+static size_t s_len(const char* s) { size_t n = 0; while (s[n]) n++; return n; }
+
+static void s_cat(char* dst, size_t cap, const char* src) {
+    size_t n = s_len(dst);
+    while (*src && n + 1 < cap) dst[n++] = *src++;
+    dst[n] = 0;
+}
+
+static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
+
+static int contains(const char* hay, const char* needle, int ignoreCase) {
+    size_t i, j, hl = s_len(hay), nl = s_len(needle);
+    if (nl == 0 || nl > hl) return 0;
+    for (i = 0; i + nl <= hl; i++) {
+        for (j = 0; j < nl; j++) {
+            char a = hay[i + j], b = needle[j];
+            if (ignoreCase) { a = lower(a); b = lower(b); }
+            if (a != b) break;
+        }
+        if (j == nl) return 1;
+    }
+    return 0;
+}
+
+static void fmt_float(char* out, float v) { /* "%.2f" */
+    char tmp[24]; int n = 0, i;
+    unsigned long long scaled;
+    char* o = out;
+    if (v < 0) { *o++ = '-'; v = -v; }
+    scaled = (unsigned long long)(v * 100.0f + 0.5f);
+    do { tmp[n++] = (char)('0' + scaled % 10); scaled /= 10; } while (scaled || n < 3);
+    for (i = n - 1; i >= 0; i--) { *o++ = tmp[i]; if (i == 2) *o++ = '.'; }
+    *o = 0;
+}
+
+static float parse_float(const char* s, float def) {
+    float sign = 1.0f, val = 0.0f, frac = 0.1f; int any = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { sign = -1.0f; s++; } else if (*s == '+') s++;
+    while (*s >= '0' && *s <= '9') { val = val * 10.0f + (float)(*s - '0'); s++; any = 1; }
+    if (*s == '.' || *s == ',') { s++; while (*s >= '0' && *s <= '9') { val += frac * (float)(*s - '0'); frac *= 0.1f; s++; any = 1; } }
+    return any ? sign * val : def;
+}
+
+/* ---------------- Plugin-Zustand ---------------- */
+static struct TS3Functions ts3;
+
+#define MAX_PATTERNS 8
+#define PATTERN_LEN 128
+static struct {
+    char patterns[MAX_PATTERNS][PATTERN_LEN];
+    int count;
+    int ignoreCase;
+    int messages;
+    float volume;
+} cfg;
+
+#define MAX_HANDLERS 32
+static struct { uint64 sch; int active; float saved; } slots[MAX_HANDLERS];
+
+static int slot_for(uint64 sch, int create) {
+    int i;
+    for (i = 0; i < MAX_HANDLERS; i++) if (slots[i].sch == sch) return i;
+    if (!create) return -1;
+    for (i = 0; i < MAX_HANDLERS; i++) if (slots[i].sch == 0) { slots[i].sch = sch; slots[i].active = 0; return i; }
+    return -1;
+}
+
+/* ---------------- Konfiguration ---------------- */
+static const char DEFAULT_INI[] =
+    "; Mute Soundpack - Einstellungen\r\n"
+    "; Aenderungen gelten beim naechsten Channel-Wechsel, kein Neustart noetig.\r\n"
+    ";\r\n"
+    "; channel = Teil des Channel-Namens, in dem die TS-Sounds leise sein sollen.\r\n"
+    ";           Mehrere 'channel='-Zeilen sind erlaubt (max. 8).\r\n"
+    "; ignorecase = 1: Gross-/Kleinschreibung egal, 0: muss exakt passen\r\n"
+    "; volume = Soundpack-Lautstaerke in dB im Channel (-100 = praktisch unhoerbar)\r\n"
+    "; messages = 1: Hinweis im Chat-Tab beim Aktivieren/Deaktivieren\r\n"
+    "\r\n"
+    "channel=ACRE\r\n"
+    "ignorecase=0\r\n"
+    "volume=-100\r\n"
+    "messages=1\r\n";
+
+static void utf8_to_wide(const char* in, unsigned short* out, int cap) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, in, -1, out, cap);
+    if (n <= 0) out[0] = 0;
+}
+
+static void ini_path(char* out, size_t cap) {
+    out[0] = 0;
+    ts3.getConfigPath(out, cap);
+    {
+        size_t n = s_len(out);
+        if (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') s_cat(out, cap, "\\");
+    }
+    s_cat(out, cap, INI_NAME);
+}
+
+static void load_config(void) {
+    static char buf[8192];
+    char path[1024];
+    unsigned short wpath[1024];
+    HANDLE h;
+    DWORD got = 0;
+    char* p;
+
+    cfg.count = 0; cfg.ignoreCase = 0; cfg.messages = 1; cfg.volume = -100.0f;
+
+    ini_path(path, sizeof(path));
+    utf8_to_wide(path, wpath, 1024);
+
+    h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) {
+        h = CreateFileW(wpath, GENERIC_WRITE, 0, 0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD w; WriteFile(h, DEFAULT_INI, (DWORD)(sizeof(DEFAULT_INI) - 1), &w, 0); CloseHandle(h);
+        }
+        memcpy(buf, DEFAULT_INI, sizeof(DEFAULT_INI));
+    } else {
+        if (!ReadFile(h, buf, sizeof(buf) - 1, &got, 0)) got = 0;
+        CloseHandle(h);
+        buf[got] = 0;
+    }
+
+    p = buf;
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+
+    while (*p) {
+        char* line = p; char* end; char* eq; char* key; char* val; char* k;
+        while (*p && *p != '\n' && *p != '\r') p++;
+        end = p;
+        while (*p == '\n' || *p == '\r') p++;
+        *end = 0;
+
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == ';' || *line == '#' || *line == 0) continue;
+        eq = line; while (*eq && *eq != '=') eq++;
+        if (*eq != '=') continue;
+        *eq = 0;
+        key = line; val = eq + 1;
+        k = eq - 1; while (k >= key && (*k == ' ' || *k == '\t')) *k-- = 0;
+        while (*val == ' ' || *val == '\t') val++;
+        k = val + s_len(val) - 1; while (k >= val && (*k == ' ' || *k == '\t')) *k-- = 0;
+        for (k = key; *k; k++) *k = lower(*k);
+
+        if (!s_len(key)) continue;
+        if (key[0] == 'c' && contains(key, "channel", 0) && s_len(key) == 7) {
+            if (cfg.count < MAX_PATTERNS && s_len(val) > 0) {
+                cfg.patterns[cfg.count][0] = 0;
+                s_cat(cfg.patterns[cfg.count], PATTERN_LEN, val);
+                cfg.count++;
+            }
+        } else if (contains(key, "ignorecase", 0) && s_len(key) == 10) {
+            cfg.ignoreCase = (val[0] == '1');
+        } else if (contains(key, "volume", 0) && s_len(key) == 6) {
+            cfg.volume = parse_float(val, -100.0f);
+        } else if (contains(key, "messages", 0) && s_len(key) == 8) {
+            cfg.messages = (val[0] == '1');
+        }
+    }
+}
+
+/* ---------------- Kernlogik ---------------- */
+static void say(uint64 sch, const char* msg) {
+    char buf[256];
+    if (!cfg.messages) return;
+    buf[0] = 0;
+    s_cat(buf, sizeof(buf), "[b][color=#888888]" PLUGIN_NAME ":[/color][/b] ");
+    s_cat(buf, sizeof(buf), msg);
+    ts3.printMessage(sch, buf, PLUGIN_MESSAGE_TARGET_SERVER);
+}
+
+static void deactivate(uint64 sch, int announce) {
+    char val[32];
+    int i = slot_for(sch, 0);
+    if (i < 0 || !slots[i].active) return;
+    fmt_float(val, slots[i].saved);
+    ts3.setPlaybackConfigValue(sch, "volume_factor_wave", val);
+    slots[i].active = 0;
+    if (announce) {
+        char m[96]; m[0] = 0;
+        s_cat(m, sizeof(m), "TS-Sounds wieder normal (");
+        s_cat(m, sizeof(m), val);
+        s_cat(m, sizeof(m), " dB)");
+        say(sch, m);
+    }
+}
+
+static void activate(uint64 sch) {
+    char val[32];
+    float old = 0.0f;
+    int i = slot_for(sch, 1);
+    if (i < 0 || slots[i].active) return;
+    if (ts3.getPlaybackConfigValueAsFloat(sch, "volume_factor_wave", &old) != ERROR_ok) old = 0.0f;
+    /* Falls ein frueherer Lauf abgestuerzt ist und der Wert noch abgesenkt ist,
+       nicht den abgesenkten Wert als "Original" merken. */
+    if (old <= cfg.volume + 0.01f) old = 0.0f;
+    slots[i].saved = old;
+    fmt_float(val, cfg.volume);
+    ts3.setPlaybackConfigValue(sch, "volume_factor_wave", val);
+    slots[i].active = 1;
+    {
+        char m[96]; m[0] = 0;
+        s_cat(m, sizeof(m), "Channel erkannt, TS-Sounds abgesenkt (");
+        s_cat(m, sizeof(m), val);
+        s_cat(m, sizeof(m), " dB)");
+        say(sch, m);
+    }
+}
+
+static int channel_matches(uint64 sch, uint64 channelID) {
+    char* name = 0;
+    int i, hit = 0;
+    if (ts3.getChannelVariableAsString(sch, channelID, CHANNEL_NAME, &name) != ERROR_ok || !name) return 0;
+    for (i = 0; i < cfg.count; i++) {
+        if (contains(name, cfg.patterns[i], cfg.ignoreCase)) { hit = 1; break; }
+    }
+    ts3.freeMemory(name);
+    return hit;
+}
+
+static int my_id(uint64 sch, anyID* me) {
+    return ts3.getClientID(sch, me) == ERROR_ok;
+}
+
+static void evaluate(uint64 sch) {
+    anyID me; uint64 ch = 0;
+    if (!my_id(sch, &me)) return;
+    if (ts3.getChannelOfClient(sch, me, &ch) != ERROR_ok) return;
+    load_config();
+    if (channel_matches(sch, ch)) activate(sch);
+    else deactivate(sch, 1);
+}
+
+static void on_own_move(uint64 sch, anyID clientID) {
+    anyID me;
+    if (my_id(sch, &me) && me == clientID) evaluate(sch);
+}
+
+/* ---------------- Pflicht-Exports ---------------- */
+EXPORT const char* ts3plugin_name(void) { return PLUGIN_NAME; }
+EXPORT const char* ts3plugin_version(void) { return PLUGIN_VERSION; }
+EXPORT int ts3plugin_apiVersion(void) { return PLUGIN_API_VERSION; }
+EXPORT const char* ts3plugin_author(void) { return "Airborne Devs"; }
+EXPORT const char* ts3plugin_description(void) {
+    return "Senkt die TeamSpeak-Soundpack-Sounds (z.B. 'User joined your channel') in konfigurierten Channels ab. "
+           "Channel-Name einstellbar in %APPDATA%\\TS3Client\\" INI_NAME;
+}
+EXPORT void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3 = funcs; }
+
+EXPORT int ts3plugin_init(void) {
+    uint64* list = 0;
+    memset(slots, 0, sizeof(slots));
+    load_config();
+    /* Plugin waehrend laufender Verbindung aktiviert: sofort pruefen */
+    if (ts3.getServerConnectionHandlerList(&list) == ERROR_ok && list) {
+        int i;
+        for (i = 0; list[i]; i++) {
+            int status = 0;
+            if (ts3.getConnectionStatus(list[i], &status) == ERROR_ok && status == STATUS_CONNECTION_ESTABLISHED)
+                evaluate(list[i]);
+        }
+        ts3.freeMemory(list);
+    }
+    return 0;
+}
+
+EXPORT void ts3plugin_shutdown(void) {
+    int i;
+    for (i = 0; i < MAX_HANDLERS; i++) if (slots[i].sch && slots[i].active) deactivate(slots[i].sch, 0);
+}
+
+EXPORT void ts3plugin_registerPluginID(const char* id) { (void)id; }
+EXPORT void ts3plugin_freeMemory(void* data) { (void)data; }
+EXPORT int ts3plugin_offersConfigure(void) { return PLUGIN_OFFERS_NO_CONFIGURE; }
+
+/* ---------------- Events ---------------- */
+EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 sch, int newStatus, unsigned int errorNumber) {
+    (void)errorNumber;
+    if (newStatus == STATUS_CONNECTION_ESTABLISHED) {
+        evaluate(sch);
+    } else if (newStatus == STATUS_DISCONNECTED) {
+        int i;
+        deactivate(sch, 0);
+        i = slot_for(sch, 0);
+        if (i >= 0) slots[i].sch = 0;
+    }
+}
+
+EXPORT void ts3plugin_onClientMoveEvent(uint64 sch, anyID clientID, uint64 oldChannelID, uint64 newChannelID, int visibility, const char* moveMessage) {
+    (void)oldChannelID; (void)newChannelID; (void)visibility; (void)moveMessage;
+    on_own_move(sch, clientID);
+}
+
+EXPORT void ts3plugin_onClientMoveMovedEvent(uint64 sch, anyID clientID, uint64 oldChannelID, uint64 newChannelID, int visibility, anyID moverID, const char* moverName, const char* moverUniqueIdentifier, const char* moveMessage) {
+    (void)oldChannelID; (void)newChannelID; (void)visibility; (void)moverID; (void)moverName; (void)moverUniqueIdentifier; (void)moveMessage;
+    on_own_move(sch, clientID);
+}
+
+EXPORT void ts3plugin_onClientKickFromChannelEvent(uint64 sch, anyID clientID, uint64 oldChannelID, uint64 newChannelID, int visibility, anyID kickerID, const char* kickerName, const char* kickerUniqueIdentifier, const char* kickMessage) {
+    (void)oldChannelID; (void)newChannelID; (void)visibility; (void)kickerID; (void)kickerName; (void)kickerUniqueIdentifier; (void)kickMessage;
+    on_own_move(sch, clientID);
+}
+
+EXPORT void ts3plugin_onUpdateChannelEditedEvent(uint64 sch, uint64 channelID, anyID invokerID, const char* invokerName, const char* invokerUniqueIdentifier) {
+    anyID me; uint64 ch = 0;
+    (void)invokerID; (void)invokerName; (void)invokerUniqueIdentifier;
+    if (my_id(sch, &me) && ts3.getChannelOfClient(sch, me, &ch) == ERROR_ok && ch == channelID) evaluate(sch);
+}
