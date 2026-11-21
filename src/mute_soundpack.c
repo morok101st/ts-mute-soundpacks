@@ -624,7 +624,7 @@ EXPORT int ts3plugin_apiVersion(void) { return PLUGIN_API_VERSION; }
 EXPORT const char* ts3plugin_author(void) { return "Airborne Devs"; }
 EXPORT const char* ts3plugin_description(void) {
     return "Senkt die TeamSpeak-Soundpack-Sounds (z.B. 'User joined your channel') in konfigurierten Channels ab. "
-           "Einstellungen ueber den Button 'Einstellungen' oder in %APPDATA%\\TS3Client\\" INI_NAME;
+           "Channels und Lautstärke über den Button 'Einstellungen' anpassen.";
 }
 EXPORT void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3 = funcs; }
 
