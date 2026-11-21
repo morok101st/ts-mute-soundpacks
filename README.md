@@ -2,7 +2,7 @@
 
 TeamSpeak-3-Plugin, das die Soundpack-Sounds (z. B. „User joined your channel“) leise schaltet, solange man sich in einem bestimmten Channel befindet. Beim Verlassen des Channels wird die vorherige Lautstärke wiederhergestellt. Sprach-Audio bleibt unverändert.
 
-Beim Betreten eines solchen Channels wird erst nach 1 Sekunde abgesenkt, damit der „Channel switched“-Sound noch vollständig zu hören ist. Beim Verlassen wird sofort zurückgesetzt.
+Beim Betreten eines solchen Channels wird erst nach 0,5 Sekunden abgesenkt, damit der „Channel switched“-Sound noch vollständig zu hören ist. Beim Verlassen wird sofort zurückgesetzt.
 
 Technisch setzt das Plugin den Playback-Wert `volume_factor_wave` pro Server-Verbindung.
 

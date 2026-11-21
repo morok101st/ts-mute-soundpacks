@@ -158,7 +158,7 @@ static struct {
 
 /* Verzoegerung beim Betreten eines Mute-Channels, damit der
    "Channel switched"-Sound noch vollstaendig abgespielt wird. */
-#define ACTIVATE_DELAY_MS 1000
+#define ACTIVATE_DELAY_MS 500
 
 /* Events, Einstellungsdialog und Timer laufen in verschiedenen Threads. */
 static CRITSEC lock;
