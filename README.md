@@ -32,6 +32,10 @@ messages=1
 
 Änderungen gelten beim nächsten Channel-Wechsel, ein Neustart ist nicht nötig.
 
+## Absturzschutz
+
+Während die Sounds abgesenkt sind, merkt sich das Plugin den ursprünglichen Wert in `%APPDATA%\TS3Client\mute_soundpack.state`. Wird TeamSpeak beendet, ohne dass das Plugin zurücksetzen konnte (Absturz, Task-Manager), stellt es beim nächsten Verbinden in einem normalen Channel den alten Wert wieder her. Beim regulären Verlassen des Channels oder Beenden wird die Datei gelöscht.
+
 ## Bauen
 
 Voraussetzung: Visual Studio 2022 oder neuer bzw. die Build Tools mit „Desktopentwicklung mit C++“.

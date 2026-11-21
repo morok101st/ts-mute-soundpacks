@@ -18,6 +18,7 @@
 #define PLUGIN_NAME "Mute Soundpack"
 #define PLUGIN_VERSION "1.1"
 #define INI_NAME "mute_soundpack.ini"
+#define STATE_NAME "mute_soundpack.state"
 
 /* ---------------- minimale Win32-Deklarationen ---------------- */
 typedef void* HANDLE;
@@ -28,6 +29,7 @@ typedef int BOOL;
 #define GENERIC_WRITE 0x40000000UL
 #define FILE_SHARE_READ 0x1
 #define CREATE_NEW 1
+#define CREATE_ALWAYS 2
 #define OPEN_EXISTING 3
 #define FILE_ATTRIBUTE_NORMAL 0x80
 #define CP_UTF8 65001
@@ -36,6 +38,7 @@ __declspec(dllimport) HANDLE CreateFileW(const unsigned short*, DWORD, DWORD, vo
 __declspec(dllimport) BOOL ReadFile(HANDLE, void*, DWORD, DWORD*, void*);
 __declspec(dllimport) BOOL WriteFile(HANDLE, const void*, DWORD, DWORD*, void*);
 __declspec(dllimport) BOOL CloseHandle(HANDLE);
+__declspec(dllimport) BOOL DeleteFileW(const unsigned short*);
 __declspec(dllimport) int MultiByteToWideChar(unsigned int, DWORD, const char*, int, unsigned short*, int);
 
 /* ---------------- CRT-Ersatz ---------------- */
@@ -147,19 +150,20 @@ static void utf8_to_wide(const char* in, unsigned short* out, int cap) {
     if (n <= 0) out[0] = 0;
 }
 
-static void ini_path(char* out, size_t cap) {
+static void config_file(unsigned short* wout, int wcap, const char* name) {
+    char out[1024];
     out[0] = 0;
-    ts3.getConfigPath(out, cap);
+    ts3.getConfigPath(out, sizeof(out));
     {
         size_t n = s_len(out);
-        if (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') s_cat(out, cap, "\\");
+        if (n > 0 && out[n - 1] != '\\' && out[n - 1] != '/') s_cat(out, sizeof(out), "\\");
     }
-    s_cat(out, cap, INI_NAME);
+    s_cat(out, sizeof(out), name);
+    utf8_to_wide(out, wout, wcap);
 }
 
 static void load_config(void) {
     static char buf[8192];
-    char path[1024];
     unsigned short wpath[1024];
     HANDLE h;
     DWORD got = 0;
@@ -167,8 +171,7 @@ static void load_config(void) {
 
     cfg.count = 0; cfg.ignoreCase = 0; cfg.messages = 1; cfg.volume = -100.0f;
 
-    ini_path(path, sizeof(path));
-    utf8_to_wide(path, wpath, 1024);
+    config_file(wpath, 1024, INI_NAME);
 
     h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == INVALID_HANDLE_VALUE) {
@@ -221,6 +224,46 @@ static void load_config(void) {
     }
 }
 
+/* ---------------- Zustandsdatei (Absturzschutz) ----------------
+ * Solange mindestens eine Verbindung abgesenkt ist, liegt neben der ini eine
+ * Datei mit dem Original-Wert von volume_factor_wave. Wird TeamSpeak beendet,
+ * ohne dass das Plugin zuruecksetzen konnte (Absturz, Task-Manager), stellt
+ * das Plugin beim naechsten Start diesen Wert wieder her. */
+static int state_read(float* v) {
+    unsigned short w[1024]; char buf[32]; DWORD got = 0; HANDLE h;
+    config_file(w, 1024, STATE_NAME);
+    h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!ReadFile(h, buf, sizeof(buf) - 1, &got, 0)) got = 0;
+    CloseHandle(h);
+    buf[got] = 0;
+    if (got == 0) return 0;
+    *v = parse_float(buf, 0.0f);
+    return 1;
+}
+
+static void state_write(float v) {
+    unsigned short w[1024]; char buf[32]; DWORD n; HANDLE h;
+    config_file(w, 1024, STATE_NAME);
+    fmt_float(buf, v);
+    h = CreateFileW(w, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile(h, buf, (DWORD)s_len(buf), &n, 0);
+    CloseHandle(h);
+}
+
+static void state_clear(void) {
+    unsigned short w[1024];
+    config_file(w, 1024, STATE_NAME);
+    DeleteFileW(w);
+}
+
+static int any_active(void) {
+    int i;
+    for (i = 0; i < MAX_HANDLERS; i++) if (slots[i].sch && slots[i].active) return 1;
+    return 0;
+}
+
 /* ---------------- Kernlogik ---------------- */
 static void say(uint64 sch, const char* msg) {
     char buf[256];
@@ -238,6 +281,7 @@ static void deactivate(uint64 sch, int announce) {
     fmt_float(val, slots[i].saved);
     ts3.setPlaybackConfigValue(sch, "volume_factor_wave", val);
     slots[i].active = 0;
+    if (!any_active()) state_clear();
     if (announce) {
         char m[96]; m[0] = 0;
         s_cat(m, sizeof(m), "TS-Sounds wieder normal (");
@@ -253,9 +297,16 @@ static void activate(uint64 sch) {
     int i = slot_for(sch, 1);
     if (i < 0 || slots[i].active) return;
     if (ts3.getPlaybackConfigValueAsFloat(sch, "volume_factor_wave", &old) != ERROR_ok) old = 0.0f;
-    /* Falls ein frueherer Lauf abgestuerzt ist und der Wert noch abgesenkt ist,
-       nicht den abgesenkten Wert als "Original" merken. */
-    if (old <= cfg.volume + 0.01f) old = 0.0f;
+    if (!any_active()) {
+        /* Rest eines Absturzes: gespeicherten Original-Wert bevorzugen,
+           sonst nie den abgesenkten Wert als "Original" merken. */
+        float s;
+        if (state_read(&s) && old < s - 0.01f) old = s;
+        else if (old <= cfg.volume + 0.01f) old = 0.0f;
+        state_write(old);
+    } else if (old <= cfg.volume + 0.01f) {
+        old = 0.0f;
+    }
     slots[i].saved = old;
     fmt_float(val, cfg.volume);
     ts3.setPlaybackConfigValue(sch, "volume_factor_wave", val);
@@ -267,6 +318,23 @@ static void activate(uint64 sch) {
         s_cat(m, sizeof(m), " dB)");
         say(sch, m);
     }
+}
+
+/* Nicht im Mute-Channel und nichts aktiv: Wert eines abgestuerzten Laufs zuruecksetzen. */
+static void recover(uint64 sch) {
+    float s, cur = 0.0f;
+    if (any_active() || !state_read(&s)) return;
+    if (ts3.getPlaybackConfigValueAsFloat(sch, "volume_factor_wave", &cur) == ERROR_ok && cur < s - 0.01f) {
+        char val[32], m[128];
+        fmt_float(val, s);
+        ts3.setPlaybackConfigValue(sch, "volume_factor_wave", val);
+        m[0] = 0;
+        s_cat(m, sizeof(m), "TS-Sounds nach unsauberem Beenden wiederhergestellt (");
+        s_cat(m, sizeof(m), val);
+        s_cat(m, sizeof(m), " dB)");
+        say(sch, m);
+    }
+    state_clear();
 }
 
 static int channel_matches(uint64 sch, uint64 channelID) {
@@ -289,8 +357,13 @@ static void evaluate(uint64 sch) {
     if (!my_id(sch, &me)) return;
     if (ts3.getChannelOfClient(sch, me, &ch) != ERROR_ok) return;
     load_config();
-    if (channel_matches(sch, ch)) activate(sch);
-    else deactivate(sch, 1);
+    if (channel_matches(sch, ch)) {
+        activate(sch);
+    } else {
+        int i = slot_for(sch, 0);
+        if (i >= 0 && slots[i].active) deactivate(sch, 1);
+        else recover(sch);
+    }
 }
 
 static void on_own_move(uint64 sch, anyID clientID) {
