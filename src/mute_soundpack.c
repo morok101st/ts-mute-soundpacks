@@ -16,7 +16,7 @@
 #define EXPORT __declspec(dllexport)
 #define PLUGIN_API_VERSION 26
 #define PLUGIN_NAME "Mute Soundpack"
-#define PLUGIN_VERSION "1.3"
+#define PLUGIN_VERSION "1.4"
 #define INI_NAME "mute_soundpack.ini"
 #define STATE_NAME "mute_soundpack.state"
 
