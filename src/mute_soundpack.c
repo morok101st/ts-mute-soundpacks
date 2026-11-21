@@ -28,7 +28,6 @@ typedef int BOOL;
 #define GENERIC_READ 0x80000000UL
 #define GENERIC_WRITE 0x40000000UL
 #define FILE_SHARE_READ 0x1
-#define CREATE_NEW 1
 #define CREATE_ALWAYS 2
 #define OPEN_EXISTING 3
 #define FILE_ATTRIBUTE_NORMAL 0x80
@@ -98,6 +97,11 @@ static void s_cat(char* dst, size_t cap, const char* src) {
     dst[n] = 0;
 }
 
+static int s_eq(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
 static char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; }
 
 static int contains(const char* hay, const char* needle, int ignoreCase) {
@@ -139,6 +143,9 @@ static struct TS3Functions ts3;
 
 #define MAX_PATTERNS 8
 #define PATTERN_LEN 128
+#define DEFAULT_CHANNEL "ACRE"
+#define STR_(x) #x
+#define STR(x) STR_(x)
 static struct {
     char patterns[MAX_PATTERNS][PATTERN_LEN];
     int count;
@@ -176,21 +183,6 @@ static int slot_for(uint64 sch, int create) {
 }
 
 /* ---------------- Konfiguration ---------------- */
-static const char DEFAULT_INI[] =
-    "; Mute Soundpack - Einstellungen\r\n"
-    "; Aenderungen gelten beim naechsten Channel-Wechsel, kein Neustart noetig.\r\n"
-    ";\r\n"
-    "; channel = Teil des Channel-Namens, in dem die TS-Sounds leise sein sollen.\r\n"
-    ";           Mehrere 'channel='-Zeilen sind erlaubt (max. 8).\r\n"
-    "; ignorecase = 1: Gross-/Kleinschreibung egal, 0: muss exakt passen\r\n"
-    "; volume = Soundpack-Lautstaerke in dB im Channel (-100 = praktisch unhoerbar)\r\n"
-    "; messages = 1: Hinweis im Chat-Tab beim Aktivieren/Deaktivieren\r\n"
-    "\r\n"
-    "channel=ACRE\r\n"
-    "ignorecase=0\r\n"
-    "volume=-100\r\n"
-    "messages=1\r\n";
-
 static void utf8_to_wide(const char* in, unsigned short* out, int cap) {
     int n = MultiByteToWideChar(CP_UTF8, 0, in, -1, out, cap);
     if (n <= 0) out[0] = 0;
@@ -208,6 +200,8 @@ static void config_file(unsigned short* wout, int wcap, const char* name) {
     utf8_to_wide(out, wout, wcap);
 }
 
+static int save_config(void);
+
 static void load_config(void) {
     static char buf[8192];
     unsigned short wpath[1024];
@@ -215,22 +209,23 @@ static void load_config(void) {
     DWORD got = 0;
     char* p;
 
+    /* Standardwerte fuer fehlende Schluessel */
     cfg.count = 0; cfg.ignoreCase = 0; cfg.messages = 1; cfg.volume = -100.0f;
 
     config_file(wpath, 1024, INI_NAME);
 
     h = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
     if (h == INVALID_HANDLE_VALUE) {
-        h = CreateFileW(wpath, GENERIC_WRITE, 0, 0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
-        if (h != INVALID_HANDLE_VALUE) {
-            DWORD w; WriteFile(h, DEFAULT_INI, (DWORD)(sizeof(DEFAULT_INI) - 1), &w, 0); CloseHandle(h);
-        }
-        memcpy(buf, DEFAULT_INI, sizeof(DEFAULT_INI));
-    } else {
-        if (!ReadFile(h, buf, sizeof(buf) - 1, &got, 0)) got = 0;
-        CloseHandle(h);
-        buf[got] = 0;
+        /* Erster Start: ini mit Standard-Channel anlegen */
+        cfg.patterns[0][0] = 0;
+        s_cat(cfg.patterns[0], PATTERN_LEN, DEFAULT_CHANNEL);
+        cfg.count = 1;
+        save_config();
+        return;
     }
+    if (!ReadFile(h, buf, sizeof(buf) - 1, &got, 0)) got = 0;
+    CloseHandle(h);
+    buf[got] = 0;
 
     p = buf;
     if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
@@ -253,21 +248,59 @@ static void load_config(void) {
         k = val + s_len(val) - 1; while (k >= val && (*k == ' ' || *k == '\t')) *k-- = 0;
         for (k = key; *k; k++) *k = lower(*k);
 
-        if (!s_len(key)) continue;
-        if (key[0] == 'c' && contains(key, "channel", 0) && s_len(key) == 7) {
+        if (s_eq(key, "channel")) {
             if (cfg.count < MAX_PATTERNS && s_len(val) > 0) {
                 cfg.patterns[cfg.count][0] = 0;
                 s_cat(cfg.patterns[cfg.count], PATTERN_LEN, val);
                 cfg.count++;
             }
-        } else if (contains(key, "ignorecase", 0) && s_len(key) == 10) {
+        } else if (s_eq(key, "ignorecase")) {
             cfg.ignoreCase = (val[0] == '1');
-        } else if (contains(key, "volume", 0) && s_len(key) == 6) {
+        } else if (s_eq(key, "volume")) {
             cfg.volume = parse_float(val, -100.0f);
-        } else if (contains(key, "messages", 0) && s_len(key) == 8) {
+        } else if (s_eq(key, "messages")) {
             cfg.messages = (val[0] == '1');
         }
     }
+}
+
+static int save_config(void) {
+    static char out[4096];
+    char num[32];
+    unsigned short w[1024];
+    HANDLE h;
+    DWORD n;
+    int i;
+    out[0] = 0;
+    s_cat(out, sizeof(out),
+        "; " PLUGIN_NAME " - Einstellungen\r\n"
+        "; Am einfachsten ueber TeamSpeak > Optionen > Addons > " PLUGIN_NAME " > Einstellungen.\r\n"
+        "; Bei direkter Bearbeitung gelten Aenderungen beim naechsten Channel-Wechsel.\r\n"
+        ";\r\n"
+        "; channel    = Teil des Channel-Namens, in dem die TS-Sounds leise sein sollen.\r\n"
+        ";              Mehrere 'channel='-Zeilen sind erlaubt (max. " STR(MAX_PATTERNS) ").\r\n"
+        "; ignorecase = 1: Gross-/Kleinschreibung egal, 0: muss exakt passen\r\n"
+        "; volume     = Soundpack-Lautstaerke in dB im Channel (-100 = praktisch unhoerbar)\r\n"
+        "; messages   = 1: Hinweis im Chat beim Absenken/Zuruecksetzen\r\n"
+        "\r\n");
+    for (i = 0; i < cfg.count; i++) {
+        s_cat(out, sizeof(out), "channel=");
+        s_cat(out, sizeof(out), cfg.patterns[i]);
+        s_cat(out, sizeof(out), "\r\n");
+    }
+    s_cat(out, sizeof(out), cfg.ignoreCase ? "ignorecase=1\r\n" : "ignorecase=0\r\n");
+    fmt_float(num, cfg.volume);
+    s_cat(out, sizeof(out), "volume=");
+    s_cat(out, sizeof(out), num);
+    s_cat(out, sizeof(out), "\r\n");
+    s_cat(out, sizeof(out), cfg.messages ? "messages=1\r\n" : "messages=0\r\n");
+
+    config_file(w, 1024, INI_NAME);
+    h = CreateFileW(w, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!WriteFile(h, out, (DWORD)s_len(out), &n, 0)) n = 0;
+    CloseHandle(h);
+    return n == s_len(out);
 }
 
 /* ---------------- Zustandsdatei (Absturzschutz) ----------------
@@ -548,7 +581,7 @@ static const void* build_template(void) {
     tpl_word(9); tpl_str(L"Segoe UI");
 
     tpl_item(0, 7, 7, 216, 18, 0xFFFF, CLS_STATIC,
-             L"Channels, in denen die TS-Sounds abgesenkt werden.\nTeil des Channel-Namens, einer pro Zeile (max. 8):");
+             L"Channels, in denen die TS-Sounds abgesenkt werden.\nTeil des Channel-Namens, einer pro Zeile (max. " STR(MAX_PATTERNS) "):");
     tpl_item(WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
              7, 28, 216, 62, IDC_CHANNELS, CLS_EDIT, L"");
     tpl_item(WS_TABSTOP | BS_AUTOCHECKBOX, 7, 96, 216, 10, IDC_IGNORECASE, CLS_BUTTON,
@@ -585,45 +618,6 @@ static void copy_utf8(char* dst, size_t cap, const char* src, size_t n) {
     }
     for (i = 0; i < n; i++) dst[i] = src[i];
     dst[n] = 0;
-}
-
-static int save_config(void) {
-    static char out[4096];
-    char num[32];
-    unsigned short w[1024];
-    HANDLE h;
-    DWORD n;
-    int i;
-    out[0] = 0;
-    s_cat(out, sizeof(out),
-        "; " PLUGIN_NAME " - Einstellungen\r\n"
-        "; Bearbeitbar ueber TeamSpeak > Optionen > Addons > " PLUGIN_NAME " > Einstellungen\r\n"
-        "; oder direkt hier. Aenderungen gelten beim naechsten Channel-Wechsel.\r\n"
-        ";\r\n"
-        "; channel = Teil des Channel-Namens, in dem die TS-Sounds leise sein sollen.\r\n"
-        ";           Mehrere 'channel='-Zeilen sind erlaubt (max. 8).\r\n"
-        "; ignorecase = 1: Gross-/Kleinschreibung egal, 0: muss exakt passen\r\n"
-        "; volume = Soundpack-Lautstaerke in dB im Channel (-100 = praktisch unhoerbar)\r\n"
-        "; messages = 1: Hinweis im Chat-Tab beim Aktivieren/Deaktivieren\r\n"
-        "\r\n");
-    for (i = 0; i < cfg.count; i++) {
-        s_cat(out, sizeof(out), "channel=");
-        s_cat(out, sizeof(out), cfg.patterns[i]);
-        s_cat(out, sizeof(out), "\r\n");
-    }
-    s_cat(out, sizeof(out), cfg.ignoreCase ? "ignorecase=1\r\n" : "ignorecase=0\r\n");
-    fmt_float(num, cfg.volume);
-    s_cat(out, sizeof(out), "volume=");
-    s_cat(out, sizeof(out), num);
-    s_cat(out, sizeof(out), "\r\n");
-    s_cat(out, sizeof(out), cfg.messages ? "messages=1\r\n" : "messages=0\r\n");
-
-    config_file(w, 1024, INI_NAME);
-    h = CreateFileW(w, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    if (!WriteFile(h, out, (DWORD)s_len(out), &n, 0)) n = 0;
-    CloseHandle(h);
-    return n == s_len(out);
 }
 
 static void dlg_init(HWND dlg) {
@@ -702,8 +696,8 @@ EXPORT const char* ts3plugin_version(void) { return PLUGIN_VERSION; }
 EXPORT int ts3plugin_apiVersion(void) { return PLUGIN_API_VERSION; }
 EXPORT const char* ts3plugin_author(void) { return "Airborne Devs"; }
 EXPORT const char* ts3plugin_description(void) {
-    return "Senkt die TeamSpeak-Soundpack-Sounds (z.B. 'User joined your channel') in konfigurierten Channels ab. "
-           "Channels und Lautstärke über den Button 'Einstellungen' anpassen.";
+    return "Verringert die Lautstärke des TS-Soundpacks oder schaltet es komplett aus, sobald man einen "
+           "in der Konfiguration definierten Channel betritt. Einstellungen über den Button 'Einstellungen'.";
 }
 EXPORT void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3 = funcs; }
 
