@@ -5,7 +5,7 @@
  * solange man sich in einem konfigurierten Channel befindet, und stellt den
  * vorherigen Wert beim Verlassen wieder her. Sprach-Audio wird nicht angefasst.
  *
- * Gebaut ohne C-Laufzeitbibliothek (freestanding), importiert nur kernel32.
+ * Gebaut ohne C-Laufzeitbibliothek (freestanding), importiert nur kernel32 und user32.
  */
 
 #include "ts3_functions.h"
@@ -40,6 +40,24 @@ __declspec(dllimport) BOOL WriteFile(HANDLE, const void*, DWORD, DWORD*, void*);
 __declspec(dllimport) BOOL CloseHandle(HANDLE);
 __declspec(dllimport) BOOL DeleteFileW(const unsigned short*);
 __declspec(dllimport) int MultiByteToWideChar(unsigned int, DWORD, const char*, int, unsigned short*, int);
+__declspec(dllimport) int WideCharToMultiByte(unsigned int, DWORD, const unsigned short*, int, char*, int, const char*, BOOL*);
+
+/* user32 (nur fuer den Einstellungsdialog) */
+typedef void* HWND;
+typedef long long INT_PTR;
+typedef unsigned long long WPARAM;
+typedef long long LPARAM;
+typedef INT_PTR (__stdcall *DLGPROC)(HWND, unsigned int, WPARAM, LPARAM);
+__declspec(dllimport) INT_PTR __stdcall DialogBoxIndirectParamW(void*, const void*, HWND, DLGPROC, LPARAM);
+__declspec(dllimport) BOOL __stdcall EndDialog(HWND, INT_PTR);
+__declspec(dllimport) BOOL __stdcall SetDlgItemTextW(HWND, int, const unsigned short*);
+__declspec(dllimport) unsigned int __stdcall GetDlgItemTextW(HWND, int, unsigned short*, int);
+__declspec(dllimport) BOOL __stdcall CheckDlgButton(HWND, int, unsigned int);
+__declspec(dllimport) unsigned int __stdcall IsDlgButtonChecked(HWND, int);
+__declspec(dllimport) HWND __stdcall GetDlgItem(HWND, int);
+__declspec(dllimport) HWND __stdcall SetFocus(HWND);
+__declspec(dllimport) HWND __stdcall GetActiveWindow(void);
+__declspec(dllimport) int __stdcall MessageBoxW(HWND, const unsigned short*, const unsigned short*, unsigned int);
 
 /* ---------------- CRT-Ersatz ---------------- */
 int _fltused = 0;
@@ -295,7 +313,13 @@ static void activate(uint64 sch) {
     char val[32];
     float old = 0.0f;
     int i = slot_for(sch, 1);
-    if (i < 0 || slots[i].active) return;
+    if (i < 0) return;
+    if (slots[i].active) {
+        /* Schon abgesenkt: nur eine evtl. geaenderte Ziel-Lautstaerke uebernehmen. */
+        fmt_float(val, cfg.volume);
+        ts3.setPlaybackConfigValue(sch, "volume_factor_wave", val);
+        return;
+    }
     if (ts3.getPlaybackConfigValueAsFloat(sch, "volume_factor_wave", &old) != ERROR_ok) old = 0.0f;
     if (!any_active()) {
         /* Rest eines Absturzes: gespeicherten Original-Wert bevorzugen,
@@ -371,22 +395,8 @@ static void on_own_move(uint64 sch, anyID clientID) {
     if (my_id(sch, &me) && me == clientID) evaluate(sch);
 }
 
-/* ---------------- Pflicht-Exports ---------------- */
-EXPORT const char* ts3plugin_name(void) { return PLUGIN_NAME; }
-EXPORT const char* ts3plugin_version(void) { return PLUGIN_VERSION; }
-EXPORT int ts3plugin_apiVersion(void) { return PLUGIN_API_VERSION; }
-EXPORT const char* ts3plugin_author(void) { return "Airborne Devs"; }
-EXPORT const char* ts3plugin_description(void) {
-    return "Senkt die TeamSpeak-Soundpack-Sounds (z.B. 'User joined your channel') in konfigurierten Channels ab. "
-           "Channel-Name einstellbar in %APPDATA%\\TS3Client\\" INI_NAME;
-}
-EXPORT void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3 = funcs; }
-
-EXPORT int ts3plugin_init(void) {
+static void evaluate_all(void) {
     uint64* list = 0;
-    memset(slots, 0, sizeof(slots));
-    load_config();
-    /* Plugin waehrend laufender Verbindung aktiviert: sofort pruefen */
     if (ts3.getServerConnectionHandlerList(&list) == ERROR_ok && list) {
         int i;
         for (i = 0; list[i]; i++) {
@@ -396,6 +406,233 @@ EXPORT int ts3plugin_init(void) {
         }
         ts3.freeMemory(list);
     }
+}
+
+/* ---------------- Einstellungsdialog ---------------- */
+#define IDOK 1
+#define IDCANCEL 2
+#define IDC_CHANNELS 101
+#define IDC_IGNORECASE 102
+#define IDC_VOLUME 103
+#define IDC_MESSAGES 104
+#define WM_INITDIALOG 0x0110
+#define WM_COMMAND 0x0111
+#define MB_OK_WARN 0x30
+
+#define WS_CHILD 0x40000000L
+#define WS_VISIBLE 0x10000000L
+#define WS_TABSTOP 0x00010000L
+#define WS_BORDER 0x00800000L
+#define WS_VSCROLL 0x00200000L
+#define WS_POPUP 0x80000000L
+#define WS_CAPTION 0x00C00000L
+#define WS_SYSMENU 0x00080000L
+#define DS_SETFONT 0x40L
+#define DS_MODALFRAME 0x80L
+#define DS_CENTER 0x0800L
+#define ES_MULTILINE 0x0004L
+#define ES_AUTOVSCROLL 0x0040L
+#define ES_AUTOHSCROLL 0x0080L
+#define ES_WANTRETURN 0x1000L
+#define BS_DEFPUSHBUTTON 0x1L
+#define BS_AUTOCHECKBOX 0x3L
+#define WS_EX_CLIENTEDGE 0x200L
+
+#define CLS_BUTTON 0x0080
+#define CLS_EDIT 0x0081
+#define CLS_STATIC 0x0082
+
+static DWORD tpl_buf[1024];
+static unsigned short* tpl_p;
+
+static void tpl_word(unsigned short w) { *tpl_p++ = w; }
+static void tpl_dword(DWORD d) { tpl_word((unsigned short)(d & 0xFFFF)); tpl_word((unsigned short)(d >> 16)); }
+static void tpl_str(const unsigned short* t) { do { tpl_word(*t); } while (*t++); }
+static void tpl_align(void) { if (((unsigned long long)tpl_p) & 2) tpl_word(0); }
+
+static void tpl_item(DWORD style, short x, short y, short cx, short cy, unsigned short id, unsigned short cls, const unsigned short* text) {
+    tpl_align();
+    tpl_dword(style | WS_CHILD | WS_VISIBLE);
+    tpl_dword(cls == CLS_EDIT ? WS_EX_CLIENTEDGE : 0);
+    tpl_word((unsigned short)x); tpl_word((unsigned short)y);
+    tpl_word((unsigned short)cx); tpl_word((unsigned short)cy);
+    tpl_word(id);
+    tpl_word(0xFFFF); tpl_word(cls);
+    tpl_str(text);
+    tpl_word(0);
+}
+
+static const void* build_template(void) {
+    tpl_p = (unsigned short*)tpl_buf;
+    tpl_dword(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT | DS_CENTER);
+    tpl_dword(0);
+    tpl_word(8);                       /* Anzahl Controls */
+    tpl_word(0); tpl_word(0);          /* x, y */
+    tpl_word(230); tpl_word(172);      /* cx, cy */
+    tpl_word(0); tpl_word(0);          /* kein Menue, Standard-Klasse */
+    tpl_str(L"" PLUGIN_NAME " – Einstellungen");
+    tpl_word(9); tpl_str(L"Segoe UI");
+
+    tpl_item(0, 7, 7, 216, 18, 0xFFFF, CLS_STATIC,
+             L"Channels, in denen die TS-Sounds abgesenkt werden.\nTeil des Channel-Namens, einer pro Zeile (max. 8):");
+    tpl_item(WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+             7, 28, 216, 62, IDC_CHANNELS, CLS_EDIT, L"");
+    tpl_item(WS_TABSTOP | BS_AUTOCHECKBOX, 7, 96, 216, 10, IDC_IGNORECASE, CLS_BUTTON,
+             L"Groß-/Kleinschreibung ignorieren");
+    tpl_item(0, 7, 115, 160, 10, 0xFFFF, CLS_STATIC,
+             L"Lautstärke im Channel in dB (-100 = unhörbar):");
+    tpl_item(WS_TABSTOP | ES_AUTOHSCROLL, 170, 113, 53, 13, IDC_VOLUME, CLS_EDIT, L"");
+    tpl_item(WS_TABSTOP | BS_AUTOCHECKBOX, 7, 132, 216, 10, IDC_MESSAGES, CLS_BUTTON,
+             L"Hinweis im Chat anzeigen");
+    tpl_item(WS_TABSTOP | BS_DEFPUSHBUTTON, 119, 151, 50, 14, IDOK, CLS_BUTTON, L"OK");
+    tpl_item(WS_TABSTOP, 173, 151, 50, 14, IDCANCEL, CLS_BUTTON, L"Abbrechen");
+    return tpl_buf;
+}
+
+static void set_text_utf8(HWND dlg, int id, const char* utf8) {
+    static unsigned short w[2048];
+    utf8_to_wide(utf8, w, 2048);
+    SetDlgItemTextW(dlg, id, w);
+}
+
+static void get_text_utf8(HWND dlg, int id, char* out, int cap) {
+    static unsigned short w[2048];
+    w[0] = 0;
+    GetDlgItemTextW(dlg, id, w, 2048);
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, 0, 0) <= 0) out[0] = 0;
+}
+
+/* Kopiert hoechstens cap-1 Bytes, ohne ein UTF-8-Zeichen zu zerschneiden. */
+static void copy_utf8(char* dst, size_t cap, const char* src, size_t n) {
+    size_t i;
+    if (n > cap - 1) {
+        n = cap - 1;
+        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
+    }
+    for (i = 0; i < n; i++) dst[i] = src[i];
+    dst[n] = 0;
+}
+
+static int save_config(void) {
+    static char out[4096];
+    char num[32];
+    unsigned short w[1024];
+    HANDLE h;
+    DWORD n;
+    int i;
+    out[0] = 0;
+    s_cat(out, sizeof(out),
+        "; " PLUGIN_NAME " - Einstellungen\r\n"
+        "; Bearbeitbar ueber TeamSpeak > Optionen > Addons > " PLUGIN_NAME " > Einstellungen\r\n"
+        "; oder direkt hier. Aenderungen gelten beim naechsten Channel-Wechsel.\r\n"
+        ";\r\n"
+        "; channel = Teil des Channel-Namens, in dem die TS-Sounds leise sein sollen.\r\n"
+        ";           Mehrere 'channel='-Zeilen sind erlaubt (max. 8).\r\n"
+        "; ignorecase = 1: Gross-/Kleinschreibung egal, 0: muss exakt passen\r\n"
+        "; volume = Soundpack-Lautstaerke in dB im Channel (-100 = praktisch unhoerbar)\r\n"
+        "; messages = 1: Hinweis im Chat-Tab beim Aktivieren/Deaktivieren\r\n"
+        "\r\n");
+    for (i = 0; i < cfg.count; i++) {
+        s_cat(out, sizeof(out), "channel=");
+        s_cat(out, sizeof(out), cfg.patterns[i]);
+        s_cat(out, sizeof(out), "\r\n");
+    }
+    s_cat(out, sizeof(out), cfg.ignoreCase ? "ignorecase=1\r\n" : "ignorecase=0\r\n");
+    fmt_float(num, cfg.volume);
+    s_cat(out, sizeof(out), "volume=");
+    s_cat(out, sizeof(out), num);
+    s_cat(out, sizeof(out), "\r\n");
+    s_cat(out, sizeof(out), cfg.messages ? "messages=1\r\n" : "messages=0\r\n");
+
+    config_file(w, 1024, INI_NAME);
+    h = CreateFileW(w, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!WriteFile(h, out, (DWORD)s_len(out), &n, 0)) n = 0;
+    CloseHandle(h);
+    return n == s_len(out);
+}
+
+static void dlg_init(HWND dlg) {
+    static char chans[MAX_PATTERNS * (PATTERN_LEN + 2) + 1];
+    char num[32];
+    int i;
+    load_config();
+    chans[0] = 0;
+    for (i = 0; i < cfg.count; i++) {
+        if (i) s_cat(chans, sizeof(chans), "\r\n");
+        s_cat(chans, sizeof(chans), cfg.patterns[i]);
+    }
+    set_text_utf8(dlg, IDC_CHANNELS, chans);
+    fmt_float(num, cfg.volume);
+    set_text_utf8(dlg, IDC_VOLUME, num);
+    CheckDlgButton(dlg, IDC_IGNORECASE, cfg.ignoreCase ? 1 : 0);
+    CheckDlgButton(dlg, IDC_MESSAGES, cfg.messages ? 1 : 0);
+}
+
+static int dlg_apply(HWND dlg) {
+    static char chans[8192];
+    char num[64];
+    char* p;
+    float vol;
+
+    get_text_utf8(dlg, IDC_VOLUME, num, sizeof(num));
+    vol = parse_float(num, 1000.0f);
+    if (vol < -100.0f || vol > 20.0f) {
+        MessageBoxW(dlg, L"Bitte eine Lautstärke zwischen -100 und 20 dB eingeben.", L"" PLUGIN_NAME, MB_OK_WARN);
+        SetFocus(GetDlgItem(dlg, IDC_VOLUME));
+        return 0;
+    }
+
+    get_text_utf8(dlg, IDC_CHANNELS, chans, sizeof(chans));
+    cfg.count = 0;
+    p = chans;
+    while (*p && cfg.count < MAX_PATTERNS) {
+        char* a = p; char* e;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        e = p;
+        while (*p == '\r' || *p == '\n') p++;
+        while (a < e && (*a == ' ' || *a == '\t')) a++;
+        while (e > a && (e[-1] == ' ' || e[-1] == '\t')) e--;
+        if (e > a) copy_utf8(cfg.patterns[cfg.count++], PATTERN_LEN, a, (size_t)(e - a));
+    }
+    cfg.ignoreCase = IsDlgButtonChecked(dlg, IDC_IGNORECASE) == 1;
+    cfg.messages = IsDlgButtonChecked(dlg, IDC_MESSAGES) == 1;
+    cfg.volume = vol;
+
+    if (!save_config()) {
+        MessageBoxW(dlg, L"Die Einstellungen konnten nicht gespeichert werden.", L"" PLUGIN_NAME, MB_OK_WARN);
+        return 0;
+    }
+    return 1;
+}
+
+static INT_PTR __stdcall dlg_proc(HWND dlg, unsigned int msg, WPARAM wp, LPARAM lp) {
+    (void)lp;
+    if (msg == WM_INITDIALOG) { dlg_init(dlg); return 1; }
+    if (msg == WM_COMMAND) {
+        int id = (int)(wp & 0xFFFF);
+        if (id == IDOK) { if (dlg_apply(dlg)) EndDialog(dlg, 1); return 1; }
+        if (id == IDCANCEL) { EndDialog(dlg, 0); return 1; }
+    }
+    return 0;
+}
+
+/* ---------------- Pflicht-Exports ---------------- */
+EXPORT const char* ts3plugin_name(void) { return PLUGIN_NAME; }
+EXPORT const char* ts3plugin_version(void) { return PLUGIN_VERSION; }
+EXPORT int ts3plugin_apiVersion(void) { return PLUGIN_API_VERSION; }
+EXPORT const char* ts3plugin_author(void) { return "Airborne Devs"; }
+EXPORT const char* ts3plugin_description(void) {
+    return "Senkt die TeamSpeak-Soundpack-Sounds (z.B. 'User joined your channel') in konfigurierten Channels ab. "
+           "Einstellungen ueber den Button 'Einstellungen' oder in %APPDATA%\\TS3Client\\" INI_NAME;
+}
+EXPORT void ts3plugin_setFunctionPointers(const struct TS3Functions funcs) { ts3 = funcs; }
+
+EXPORT int ts3plugin_init(void) {
+    memset(slots, 0, sizeof(slots));
+    load_config();
+    /* Plugin waehrend laufender Verbindung aktiviert: sofort pruefen */
+    evaluate_all();
     return 0;
 }
 
@@ -406,7 +643,17 @@ EXPORT void ts3plugin_shutdown(void) {
 
 EXPORT void ts3plugin_registerPluginID(const char* id) { (void)id; }
 EXPORT void ts3plugin_freeMemory(void* data) { (void)data; }
-EXPORT int ts3plugin_offersConfigure(void) { return PLUGIN_OFFERS_NO_CONFIGURE; }
+EXPORT int ts3plugin_offersConfigure(void) { return PLUGIN_OFFERS_CONFIGURE_QT_THREAD; }
+
+EXPORT void ts3plugin_configure(void* handle, void* qParentWidget) {
+    static int open = 0;
+    (void)handle; (void)qParentWidget;
+    if (open) return;
+    open = 1;
+    if (DialogBoxIndirectParamW(0, build_template(), GetActiveWindow(), dlg_proc, 0) == 1)
+        evaluate_all(); /* neue Einstellungen sofort anwenden */
+    open = 0;
+}
 
 /* ---------------- Events ---------------- */
 EXPORT void ts3plugin_onConnectStatusChangeEvent(uint64 sch, int newStatus, unsigned int errorNumber) {

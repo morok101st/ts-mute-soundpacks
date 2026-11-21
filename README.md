@@ -14,7 +14,9 @@ Nur Windows 64-bit.
 
 ## Konfiguration
 
-Beim ersten Start legt das Plugin `%APPDATA%\TS3Client\mute_soundpack.ini` an:
+Am bequemsten über TeamSpeak: *Extras → Optionen → Addons → Mute Soundpack → Einstellungen*. Dort lassen sich Channels, Groß-/Kleinschreibung, Lautstärke und Chat-Hinweis einstellen. Mit OK werden die Werte gespeichert und sofort angewendet.
+
+Die Einstellungen liegen in einer ini-Datei, die auch direkt bearbeitet werden kann. Beim ersten Start legt das Plugin `%APPDATA%\TS3Client\mute_soundpack.ini` an:
 
 ```ini
 channel=ACRE

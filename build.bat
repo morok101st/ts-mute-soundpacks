@@ -20,8 +20,8 @@ if not exist sdk\include\ts3_functions.h echo SDK fehlt - bitte "git submodule u
 if exist build rmdir /s /q build
 mkdir build\pkg\plugins || exit /b 1
 
-cl /nologo /O1 /GS- /Gs999999 /W4 /Isdk\include /c src\mute_soundpack.c /Fobuild\mute_soundpack.obj || exit /b 1
-link /nologo /DLL /NODEFAULTLIB /ENTRY:DllEntry /OUT:build\pkg\plugins\%DLL% build\mute_soundpack.obj kernel32.lib || exit /b 1
+cl /nologo /utf-8 /O1 /GS- /Gs999999 /W4 /Isdk\include /c src\mute_soundpack.c /Fobuild\mute_soundpack.obj || exit /b 1
+link /nologo /DLL /NODEFAULTLIB /ENTRY:DllEntry /OUT:build\pkg\plugins\%DLL% build\mute_soundpack.obj kernel32.lib user32.lib || exit /b 1
 del build\pkg\plugins\*.lib build\pkg\plugins\*.exp 2>nul
 
 copy /y package\package.ini build\pkg\ >nul || exit /b 1
